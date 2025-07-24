@@ -18,6 +18,78 @@ from .image_view import ImageView
 from .widgets import StyledButton
 from .motor_controller import MotorController
 
+class HumidityReader(QThread):
+    humidity_updated = pyqtSignal(float)
+    connection_status = pyqtSignal(str)
+    
+    def __init__(self, port_name):
+        super().__init__()
+        self.port_name = port_name
+        self.serial = None
+        self.running = False
+        self.humidity_value = 0.0
+        self.buffer = ""
+        
+    def run(self):
+        try:
+            self.serial = serial.Serial(
+                port=self.port_name,
+                baudrate=4800,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.1
+            )
+            self.running = True
+            self.connection_status.emit("Connected")
+            
+            while self.running:
+                if not self.serial.is_open:
+                    break
+                    
+                try:
+                    data = self.serial.readline().decode('ascii', errors='ignore')
+                    if data:
+                        print(f"Raw data received: {repr(data)}")
+                        self.buffer += data
+                        if '$' in self.buffer:
+                            data_block, self.buffer = self.buffer.split('$', 1)
+                            print(f"Data block: {repr(data_block)}")
+                        lines = data_block.split('\r')
+
+                        for line in lines:
+                            line = line.strip()
+                            print(f"Processing line: {repr(line)}")
+
+                            if line.startswith('V01') or line.startswith('V02'):
+                                if len(line) >= 7:  
+                                    humidity_hex = line[3:7]
+                                    print(f"Extracted hex: {humidity_hex}")
+                                    try:
+                                        self.humidity_value = int(humidity_hex, 16) * 0.005
+                                        #print(f"Calculated humidity: {humidity_value:.2f}%")
+                                        self.humidity_updated.emit(self.humidity_value)
+                                    except ValueError:
+                                        print(f"ValueError on line: {line}")
+
+                except Exception as e:
+                    print(f"Humidity read error: {str(e)}")
+                    time.sleep(0.1)
+                    
+        except serial.SerialException as e:
+            self.connection_status.emit(f"Port error: {str(e)}")
+        finally:
+            if self.serial and self.serial.is_open:
+                self.serial.close()
+            self.connection_status.emit("Disconnected")
+            
+    def stop(self):
+        self.running = False
+        self.wait(1000)
+        
+    def get_current_humidity(self):
+        return self.humidity_value
+
 class ScanThread(QThread):
     progress_updated = pyqtSignal(int)
     position_updated = pyqtSignal(float, float)
@@ -33,6 +105,11 @@ class ScanThread(QThread):
 
     def run(self):
         try:
+            # record start humidity
+            start_humidity = self.main_window.get_current_humidity()
+            self.main_window.scan_data['start_humidity'] = start_humidity
+            self.status_updated.emit(f"Scan start humidity: {start_humidity:.2f}%")
+
             center_x = float(self.main_window.center_x_edit.text())
             center_y = float(self.main_window.center_y_edit.text())
             width = float(self.main_window.width_edit.text())
@@ -65,7 +142,9 @@ class ScanThread(QThread):
                     'step_y': step_y,
                     't_min': t_min,
                     't_max': t_max
-                }
+                },
+                'start_humidity': start_humidity,
+                'end_humidity': None # will be set at the end
             }
 
             current_point = 0
@@ -116,6 +195,10 @@ class ScanThread(QThread):
                     progress = int(current_point / total_points * 100)
                     self.progress_updated.emit(progress)
 
+            end_humidity = self.main_window.get_current_humidity()
+            self.main_window.scan_data['end_humidity'] = end_humidity
+            self.status_updated.emit(f"Scan end humidity: {end_humidity:.2f}%")
+            
             self.scan_completed.emit(True, f"Scan completed. Collected {collected_points}/{total_points} points")
         except Exception as e:
             self.scan_completed.emit(False, f"scan error: {str(e)}")
@@ -158,6 +241,8 @@ class MainWindow(QMainWindow):
         self.scanning = False
         self.port = 8001
         self.menlo_connected = False
+        self.humidity_reader = None
+        self.humidity_value = 0.0
 
         self.scan_lock = threading.Lock()
 
@@ -181,6 +266,10 @@ class MainWindow(QMainWindow):
 
         self.realtime_timer = QTimer()
         self.realtime_timer.timeout.connect(self.update_realtime_spectrum)
+
+        self.humidity_timer = QTimer()
+        self.humidity_timer.timeout.connect(self.update_humidity_display)
+        self.humidity_timer.start(1000)  # Update every second
 
     def populate_serial_ports(self):
         ports = serial.tools.list_ports.comports()
@@ -433,7 +522,6 @@ class MainWindow(QMainWindow):
 
         self.set_light_theme()
         display_layout.addWidget(pulse_group)
-        #display_layout.addWidget(self.spectrum_plot)
         display_layout.addWidget(self.peak_value_label)
         display_layout.addWidget(image_container)
 
@@ -453,6 +541,41 @@ class MainWindow(QMainWindow):
         self.stop_scan_btn.clicked.connect(self.stop_scan)
         self.connect_spectrometer_btn.clicked.connect(self.toggle_spectrometer_connection)
         self.pp_image_view.cursor_moved.connect(self.handle_cursor_moved)
+        self.connect_humidity_btn.clicked.connect(self.toggle_humidity_connection)
+
+    def toggle_humidity_connection(self):
+        if self.humidity_reader and self.humidity_reader.isRunning():
+            # Disconnect
+            self.humidity_reader.stop()
+            self.humidity_reader = None
+            self.connect_humidity_btn.setText("Connect")
+            self.humidity_status.setStyleSheet("background-color: gray; border-radius: 10px;")
+            self.status_label.setText("Humidity sensor disconnected")
+        else:
+            # Connect
+            port = self.humidity_combo.currentText()
+            try:
+                self.humidity_reader = HumidityReader(port)
+                self.humidity_reader.humidity_updated.connect(self.update_humidity_value)
+                self.humidity_reader.connection_status.connect(self.status_label.setText)
+                self.humidity_reader.start()
+                self.connect_humidity_btn.setText("Disconnect")
+                self.humidity_status.setStyleSheet("background-color: green; border-radius: 10px;")
+                self.status_label.setText(f"Humidity sensor connected to {port}")
+            except Exception as e:
+                self.status_label.setText(f"Failed to connect humidity sensor: {str(e)}")
+                self.humidity_status.setStyleSheet("background-color: red; border-radius: 10px;")
+                
+    def update_humidity_value(self, value):
+        self.humidity_value = value
+        self.humidity_label.setText(f"Humidity: {value:.2f}%")
+        
+    def update_humidity_display(self):
+        if self.humidity_reader and self.humidity_reader.isRunning():
+            self.humidity_label.setText(f"Humidity: {self.humidity_value:.2f}%")
+            
+    def get_current_humidity(self):
+        return self.humidity_value
 
     def get_scan_params(self):
         return {
@@ -480,6 +603,7 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(f"Motor X connected to {port}")
             else:
                 self.status_label.setText("Failed to connect Motor X")
+
     def toggle_motorY_connection(self):
         if self.motorY_controller.is_connected():
             self.motorY_controller.disconnect()
@@ -707,6 +831,12 @@ class MainWindow(QMainWindow):
                 params_group = f.create_group("scan_parameters")
                 for key, value in self.scan_data['params'].items():
                     params_group.attrs[key] = value
+
+                # Save humidity values
+                if 'start_humidity' in self.scan_data:
+                    params_group.attrs['start_humidity'] = self.scan_data['start_humidity']
+                if 'end_humidity' in self.scan_data:
+                    params_group.attrs['end_humidity'] = self.scan_data['end_humidity']
 
                 if positions:
                     f.create_dataset("positions", data=np.array(positions))

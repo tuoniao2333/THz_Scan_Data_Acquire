@@ -1,3 +1,4 @@
+# motor_controller.py
 import struct
 import threading
 from enum import Enum
